@@ -9,8 +9,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from langgraph.types import Command
 
-from app.graph.build import graph, resume_graph
+from app.graph.build import graph
 from app.graph.state import initial_state
 
 app = FastAPI(title="Incident Triage Copilot", version="0.1.0")
@@ -55,7 +56,7 @@ async def start_incident(request: StartIncidentRequest):
     state = initial_state(incident_id, request.scenario, alert)
 
     config = {"configurable": {"thread_id": incident_id}}
-    graph.invoke(state, config=config)
+    graph.update_state(config, state)
 
     return {
         "incident_id": incident_id,
@@ -68,6 +69,7 @@ async def start_incident(request: StartIncidentRequest):
 async def get_state(incident_id: str):
     config = {"configurable": {"thread_id": incident_id}}
     snapshot = graph.get_state(config)
+
     return {
         "incident_id": incident_id,
         "state": snapshot.values,
@@ -80,9 +82,14 @@ async def get_state(incident_id: str):
 async def stream_events(incident_id: str):
     async def event_stream():
         config = {"configurable": {"thread_id": incident_id}}
+        snapshot = graph.get_state(config)
+
+        # Start the graph on the first event connection. If the graph is
+        # already interrupted, do not restart it; wait for an operator resume.
+        input_value = snapshot.values if not snapshot.next else None
 
         async for mode, chunk in graph.astream(
-            None,
+            input_value,
             config=config,
             stream_mode=["updates", "values"],
         ):
@@ -107,8 +114,11 @@ async def resume_incident(incident_id: str, request: ResumeRequest):
         "edited_action": request.edited_action,
     }
 
-    result = resume_graph(incident_id, decision)
     config = {"configurable": {"thread_id": incident_id}}
+    result = graph.invoke(
+        Command(resume=decision),
+        config=config,
+    )
 
     return {
         "incident_id": incident_id,
@@ -121,4 +131,8 @@ async def resume_incident(incident_id: str, request: ResumeRequest):
 async def cancel_incident(incident_id: str):
     config = {"configurable": {"thread_id": incident_id}}
     graph.update_state(config, {"status": "cancelled"})
-    return {"incident_id": incident_id, "status": "cancelled"}
+
+    return {
+        "incident_id": incident_id,
+        "status": "cancelled",
+    }
