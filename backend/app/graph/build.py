@@ -1,53 +1,26 @@
-"""Builds and compiles the incident triage graph."""
-
-from langgraph.checkpoint.sqlite import SqliteSaver
+"""Graph construction; persistence is owned by the API lifespan."""
 from langgraph.graph import END, StateGraph
-from langgraph.types import Command
-
-from app.config import DATABASE_PATH
-from app.graph.nodes import (
-    classify_alert,
-    diagnose,
-    execute_remediation,
-    investigate,
-    plan_investigation,
-    request_approval,
-)
+from app.graph.nodes import classify_alert, plan_investigation, investigate, diagnose, request_approval, execute_remediation
 from app.graph.state import IncidentState
 
+async def mark_awaiting(state):
+    return {'status': 'awaiting_approval'}
 
-def _route_after_approval(state: IncidentState) -> str:
-    approval = state.get("approval") or {}
-    return "execute_remediation" if approval.get("decision") == "approve" else END
+async def mark_rejected(state):
+    return {'status': 'needs_human'}
 
+def route(state):
+    return 'execute_remediation' if (state.get('approval') or {}).get('decision') == 'approve' else 'mark_rejected'
 
-def build_graph():
+def build_graph(checkpointer):
     builder = StateGraph(IncidentState)
-
-    builder.add_node("classify_alert", classify_alert)
-    builder.add_node("plan_investigation", plan_investigation)
-    builder.add_node("investigate", investigate)
-    builder.add_node("diagnose", diagnose)
-    builder.add_node("request_approval", request_approval)
-    builder.add_node("execute_remediation", execute_remediation)
-
-    builder.set_entry_point("classify_alert")
-    builder.add_edge("classify_alert", "plan_investigation")
-    builder.add_edge("plan_investigation", "investigate")
-    builder.add_edge("investigate", "diagnose")
-    builder.add_edge("diagnose", "request_approval")
-    builder.add_conditional_edges("request_approval", _route_after_approval)
-    builder.add_edge("execute_remediation", END)
-
-    checkpointer = SqliteSaver.from_conn_string(DATABASE_PATH)
+    for name, node in [('classify_alert', classify_alert), ('plan_investigation', plan_investigation), ('investigate', investigate), ('diagnose', diagnose), ('mark_awaiting', mark_awaiting), ('request_approval', request_approval), ('mark_rejected', mark_rejected), ('execute_remediation', execute_remediation)]:
+        builder.add_node(name, node)
+    builder.set_entry_point('classify_alert')
+    chain = ['classify_alert', 'plan_investigation', 'investigate', 'diagnose', 'mark_awaiting', 'request_approval']
+    for left, right in zip(chain, chain[1:]):
+        builder.add_edge(left, right)
+    builder.add_conditional_edges('request_approval', route)
+    builder.add_edge('mark_rejected', END)
+    builder.add_edge('execute_remediation', END)
     return builder.compile(checkpointer=checkpointer)
-
-
-graph = build_graph()
-
-
-def resume_graph(thread_id: str, decision: dict):
-    return graph.invoke(
-        Command(resume=decision),
-        config={"configurable": {"thread_id": thread_id}},
-    )
