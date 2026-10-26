@@ -1,0 +1,114 @@
+:root {
+  color-scheme: dark;
+  font-family: Inter, system-ui, sans-serif;
+}
+
+body {
+  margin: 0;
+  background: #0b1120;
+  color: #e2e8f0;
+}
+
+.app {
+  max-width: 1400px;
+  margin: 0 auto;
+  padding: 24px;
+}
+
+header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 24px;
+}
+
+h1 {
+  margin: 0;
+  font-size: 24px;
+}
+
+button {
+  background: #2563eb;
+  border: none;
+  color: white;
+  padding: 10px 16px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-weight: 600;
+}
+
+button:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+button.approve {
+  background: #16a34a;
+}
+
+button.reject {
+  background: #dc2626;
+}
+
+main {
+  display: grid;
+  grid-template-columns: 1.4fr 1fr;
+  gap: 20px;
+}
+
+.panel {
+  background: #111827;
+  border: 1px solid #1f2937;
+  border-radius: 12px;
+  padding: 20px;
+}
+
+.timeline {
+  max-height: 420px;
+  overflow: auto;
+  background: #020617;
+  border-radius: 8px;
+  padding: 12px;
+}
+
+.timeline pre {
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: 12px;
+  margin: 0 0 12px;
+}
+
+.approval-card {
+  margin-top: 20px;
+  padding: 16px;
+  border: 1px solid #f59e0b;
+  border-radius: 10px;
+  background: #1c1917;
+}
+
+textarea {
+  width: 100%;
+  min-height: 80px;
+  margin-top: 12px;
+  background: #020617;
+  color: #e2e8f0;
+  border: 1px solid #334155;
+  border-radius: 8px;
+  padding: 10px;
+}
+
+.actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.empty {
+  color: #94a3b8;
+}
+
+@media (max-width: 900px) {
+  main {
+    grid-template-columns: 1fr;
+  }
+}
