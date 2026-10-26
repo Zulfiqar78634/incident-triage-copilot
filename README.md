@@ -184,7 +184,3 @@ The agent cannot call a mutating tool until `request_approval` has received an e
 - Add prompt-injection regression tests and sandboxed tool execution.
 - Add offline evaluation scenarios and LLM-as-judge scoring.
 - Add OpenTelemetry GenAI-compatible tracing and cost dashboards.
-
-## License
-
-MIT
