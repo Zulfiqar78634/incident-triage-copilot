@@ -1,0 +1,86 @@
+name: Verify application
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    env:
+      LLM_MODE: mock
+      GOOGLE_API_KEY: ''
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install committed dependencies
+        run: python -m pip install -r backend/requirements.txt
+      - name: Check dependency consistency
+        run: python -m pip check
+      - name: Run backend tests
+        working-directory: backend
+        run: python -m pytest -v --junitxml=../backend-results.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: backend-results
+          path: backend-results.xml
+          if-no-files-found: ignore
+  browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      LLM_MODE: mock
+      GOOGLE_API_KEY: ''
+      OPENAI_API_KEY: ''
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install backend and browser runner
+        run: |
+          python -m pip install -r backend/requirements.txt
+          python -m pip install playwright==1.49.1
+          python -m playwright install --with-deps chromium
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm install
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+      - name: Start application
+        run: |
+          mkdir -p test-artifacts
+          (cd backend && python -m uvicorn app.main:app --host 127.0.0.1 --port 8000) >test-artifacts/backend.log 2>&1 &
+          (cd frontend && npm run dev -- --host 127.0.0.1 --port 5173 --strictPort) >test-artifacts/frontend.log 2>&1 &
+      - name: Wait for servers
+        run: |
+          python - <<'PY'
+          import time, urllib.request
+          for url in ['http://127.0.0.1:8000/health', 'http://localhost:5173']:
+              for attempt in range(60):
+                  try:
+                      with urllib.request.urlopen(url, timeout=2) as response:
+                          assert response.status == 200
+                      break
+                  except Exception:
+                      time.sleep(1)
+              else:
+                  raise RuntimeError('Server did not become ready: ' + url)
+          PY
+      - name: Verify browser approval journey
+        run: python scripts/browser_smoke.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: browser-evidence
+          path: test-artifacts/
+          if-no-files-found: ignore
