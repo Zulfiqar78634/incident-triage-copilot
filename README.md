@@ -59,6 +59,51 @@ SQLite Checkpointer + Simulated Platform Tools
 
 The agent state is checkpointed by `thread_id`. An incident can be inspected, resumed after a browser refresh, or continued after a backend restart.
 
+## Run with Gemini
+
+1. Get a Gemini API key from [Google AI Studio](https://aistudio.google.com/apikey).
+2. Create the backend environment file:
+
+```bash
+cd backend
+cp .env.example .env
+```
+
+3. Add your key to `backend/.env`:
+
+```env
+GOOGLE_API_KEY=your-gemini-api-key
+GEMINI_MODEL=gemini-2.0-flash
+LLM_MODE=auto
+```
+
+4. Install dependencies and run the backend:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+uvicorn app.main:app --reload --port 8000
+```
+
+5. In another terminal, run the frontend:
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+6. Open:
+
+```text
+http://localhost:5173
+```
+
+With `LLM_MODE=auto`, Gemini is used when `GOOGLE_API_KEY` is present. Without a key, the incident workflow still runs using deterministic triage logic, so the demo does not require an API key.
+
+Gemini is used for alert classification and evidence-based diagnosis. It cannot bypass the human-approval gate: a rollback is executed only after the operator explicitly approves it.
+
 ## Agent design
 
 The agent uses a bounded planner-executor pattern rather than an unconstrained agent loop.
@@ -82,35 +127,6 @@ The runtime applies a simple context budget:
 - Older observations are summarized when the working context exceeds its budget.
 - The current plan, hypotheses, failed tools, and approval state remain explicit graph state rather than being buried in chat history.
 
-## Local setup
-
-### Backend
-
-```bash
-cd backend
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
-uvicorn app.main:app --reload --port 8000
-```
-
-Set your model provider credentials in `backend/.env`.
-
-### Frontend
-
-```bash
-cd frontend
-npm install
-npm run dev
-```
-
-Open:
-
-```text
-http://localhost:5173
-```
-
 ## API
 
 ### Start an incident
@@ -127,18 +143,6 @@ POST /api/incidents
 ```http
 GET /api/incidents/{incident_id}/events
 ```
-
-Event types include:
-
-- `agent_thought`
-- `plan_updated`
-- `tool_started`
-- `tool_result`
-- `tool_error`
-- `diagnosis_ready`
-- `approval_required`
-- `state_updated`
-- `run_finished`
 
 ### Inspect persisted state
 

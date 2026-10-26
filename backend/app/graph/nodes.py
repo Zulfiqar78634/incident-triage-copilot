@@ -14,12 +14,20 @@ from app.graph.tools import (
     query_logs,
     run_diagnostic,
 )
+from app.llm import classify_with_gemini, diagnose_with_gemini
 
 
 async def classify_alert(state: dict[str, Any]) -> dict[str, Any]:
     alert = state["alert"]
     error_rate = alert.get("error_rate", 0)
-    severity = "critical" if error_rate >= 0.2 else "high"
+
+    gemini_result = classify_with_gemini(alert)
+    if gemini_result:
+        severity = gemini_result["severity"]
+        reason = gemini_result.get("reason", "Classified by Gemini.")
+    else:
+        severity = "critical" if error_rate >= 0.2 else "high"
+        reason = "Classified using deterministic alert thresholds."
 
     return {
         "severity": severity,
@@ -27,7 +35,7 @@ async def classify_alert(state: dict[str, Any]) -> dict[str, Any]:
         "messages": [
             {
                 "role": "assistant",
-                "content": f"Classified incident as {severity}: {alert.get('title')}",
+                "content": f"Classified incident as {severity}: {reason}",
             }
         ],
     }
@@ -152,17 +160,28 @@ async def diagnose(state: dict[str, Any]) -> dict[str, Any]:
     evidence = state.get("observations", [])
     errors = state.get("tool_errors", [])
 
-    diagnosis = {
-        "root_cause": "Recent payments-service v2.14.0 deployment caused dependency timeouts and checkout failures.",
-        "confidence": 0.86,
-        "evidence": [
-            "checkout-service reports payments-service timeouts",
-            "payments-service was deployed 22 minutes before the alert",
-            "payments-service logs show connection-pool exhaustion",
-        ],
-        "blast_radius": "checkout-service and payment processing",
-        "rollback_safe": True,
-    }
+    gemini_diagnosis = diagnose_with_gemini(
+        state["alert"],
+        evidence,
+        errors,
+    )
+
+    if gemini_diagnosis:
+        diagnosis = gemini_diagnosis
+        diagnosis_source = "Gemini"
+    else:
+        diagnosis = {
+            "root_cause": "Recent payments-service v2.14.0 deployment caused dependency timeouts and checkout failures.",
+            "confidence": 0.86,
+            "evidence": [
+                "checkout-service reports payments-service timeouts",
+                "payments-service was deployed 22 minutes before the alert",
+                "payments-service logs show connection-pool exhaustion",
+            ],
+            "blast_radius": "checkout-service and payment processing",
+            "rollback_safe": True,
+        }
+        diagnosis_source = "deterministic rules"
 
     proposed_action = {
         "action_type": "rollback",
@@ -176,7 +195,7 @@ async def diagnose(state: dict[str, Any]) -> dict[str, Any]:
     summary = (
         f"Investigated {state['alert'].get('service')}. "
         f"Collected {len(evidence)} observations and encountered {len(errors)} tool failures. "
-        "Diagnosis: recent payments-service deployment is the likely root cause."
+        f"Diagnosis generated using {diagnosis_source}."
     )
 
     return {
