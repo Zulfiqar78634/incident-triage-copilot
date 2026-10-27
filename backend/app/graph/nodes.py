@@ -1,275 +1,108 @@
-"""LangGraph nodes for the incident triage workflow."""
-
+"""Bounded investigation prototype. Planning remains deterministic, not model-driven."""
 import asyncio
 import json
-from typing import Any
-
+import time
 from langgraph.types import interrupt
-
 from app.config import MAX_TOOL_CALLS
-from app.graph.tools import (
-    apply_remediation,
-    get_recent_deployments,
-    get_service_health,
-    query_logs,
-    run_diagnostic,
-)
+from app.graph.tools import apply_remediation, get_recent_deployments, get_service_health, query_logs, run_diagnostic
 from app.llm import classify_with_gemini, diagnose_with_gemini
 
+async def model_call(function, *args):
+    # Timeout bounds waiting; an already running SDK thread cannot be forcibly stopped.
+    return await asyncio.wait_for(asyncio.to_thread(function, *args), timeout=45)
 
-async def classify_alert(state: dict[str, Any]) -> dict[str, Any]:
-    alert = state["alert"]
-    error_rate = alert.get("error_rate", 0)
+async def classify_alert(state):
+    result = await model_call(classify_with_gemini, state['alert'])
+    severity = result['severity'] if result else ('critical' if state['alert'].get('error_rate', 0) >= .2 else 'high')
+    return {'severity': severity, 'status': 'investigating', 'messages': [{'role': 'assistant', 'content': f'Incident classified as {severity}.'}]}
 
-    gemini_result = classify_with_gemini(alert)
-    if gemini_result:
-        severity = gemini_result["severity"]
-        reason = gemini_result.get("reason", "Classified by Gemini.")
-    else:
-        severity = "critical" if error_rate >= 0.2 else "high"
-        reason = "Classified using deterministic alert thresholds."
+async def plan_investigation(state):
+    return {'plan': [{'id': key, 'description': description, 'status': 'pending'} for key, description in [('health', 'Inspect affected service health'), ('logs', 'Inspect affected service errors'), ('dependency_health', 'Inspect unhealthy dependency'), ('deployments', 'Inspect dependency deployments'), ('dependency_logs', 'Inspect dependency errors')]], 'completed_steps': []}
 
-    return {
-        "severity": severity,
-        "status": "investigating",
-        "messages": [
-            {
-                "role": "assistant",
-                "content": f"Classified incident as {severity}: {reason}",
-            }
-        ],
-    }
-
-
-async def plan_investigation(state: dict[str, Any]) -> dict[str, Any]:
-    plan = [
-        {"id": "health", "description": "Check service and dependency health", "status": "pending"},
-        {"id": "logs", "description": "Search recent error logs", "status": "pending"},
-        {"id": "deployments", "description": "Check recent deployments", "status": "pending"},
-        {"id": "diagnostics", "description": "Run targeted dependency diagnostics", "status": "pending"},
-        {"id": "diagnosis", "description": "Correlate evidence and propose remediation", "status": "pending"},
-    ]
-
-    return {
-        "plan": plan,
-        "completed_steps": [],
-        "messages": [
-            {
-                "role": "assistant",
-                "content": "Created investigation plan: health, logs, deployments, diagnostics, diagnosis.",
-            }
-        ],
-    }
-
-
-async def _run_with_retry(tool, args: dict[str, Any], max_retries: int = 1):
-    """Runs a tool with bounded retry/backoff and returns a structured result."""
+async def _run_with_retry(tool, args, max_retries=1):
     attempts = []
-
     for attempt in range(max_retries + 1):
+        started = time.monotonic()
         try:
-            result = await tool(**args)
-            return {
-                "ok": True,
-                "attempt": attempt + 1,
-                "result": result,
-                "attempts": attempts,
-            }
-        except Exception as exc:  # noqa: BLE001 - demo boundary converts errors to state
-            attempts.append({"attempt": attempt + 1, "error": str(exc)})
+            result = await asyncio.wait_for(tool(**args), timeout=10)
+            attempts.append({'attempt': attempt + 1, 'ok': True, 'duration_ms': round((time.monotonic() - started) * 1000)})
+            return {'ok': True, 'result': result, 'attempts': attempts}
+        except (ConnectionError, TimeoutError) as exc:
+            attempts.append({'attempt': attempt + 1, 'ok': False, 'error': str(exc) or type(exc).__name__})
             if attempt < max_retries:
-                await asyncio.sleep(0.2 * (2**attempt))
+                await asyncio.sleep(.2 * 2 ** attempt)
+        except Exception as exc:
+            attempts.append({'attempt': attempt + 1, 'ok': False, 'error': str(exc)})
+            break
+    return {'ok': False, 'result': None, 'attempts': attempts}
 
-    return {
-        "ok": False,
-        "attempt": max_retries + 1,
-        "result": None,
-        "attempts": attempts,
-    }
-
-
-def _truncate(value: Any, limit: int = 700) -> Any:
-    text = json.dumps(value, default=str)
-    if len(text) <= limit:
-        return value
-    return {"truncated": True, "preview": text[:limit] + "..."}
-
-
-async def investigate(state: dict[str, Any]) -> dict[str, Any]:
-    service = state["alert"].get("service", "checkout-service")
-    observations = list(state.get("observations", []))
-    tool_errors = list(state.get("tool_errors", []))
-    completed = list(state.get("completed_steps", []))
-
-    investigation_steps = [
-        ("health", get_service_health, {"service": service}),
-        ("logs", query_logs, {"service": service, "query": "error"}),
-        ("deployments", get_recent_deployments, {"service": service}),
-        ("diagnostics", run_diagnostic, {"service": service, "dependency": "payments-service"}),
-    ]
-
-    messages = []
-
-    for step_id, tool, args in investigation_steps:
-        if step_id in completed or len(completed) >= MAX_TOOL_CALLS:
-            continue
-
+async def investigate(state):
+    service = state['alert']['service']
+    observations = []
+    errors = []
+    completed = []
+    async def collect(step, tool, args):
+        if len(observations) + len(errors) >= MAX_TOOL_CALLS:
+            return None
         outcome = await _run_with_retry(tool, args)
-
-        if outcome["ok"]:
-            observations.append(
-                {
-                    "step": step_id,
-                    "tool": tool.__name__,
-                    "args": args,
-                    "result": _truncate(outcome["result"]),
-                }
-            )
-            completed.append(step_id)
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": f"Completed {step_id} investigation using {tool.__name__}.",
-                }
-            )
+        item = {'id': f'E{len(observations) + 1}', 'step': step, 'tool': tool.__name__, 'args': args, 'attempts': outcome['attempts'], 'result': outcome['result']}
+        if outcome['ok']:
+            observations.append(item)
+            completed.append(step)
         else:
-            tool_errors.append(
-                {
-                    "step": step_id,
-                    "tool": tool.__name__,
-                    "args": args,
-                    "attempts": outcome["attempts"],
-                }
-            )
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": f"{step_id} investigation failed after retry; continuing with available evidence.",
-                }
-            )
-
-    return {
-        "observations": observations,
-        "completed_steps": completed,
-        "tool_errors": tool_errors,
-        "messages": messages,
-    }
+            errors.append(item)
+        return outcome['result']
+    health = await collect('health', get_service_health, {'service': service})
+    await collect('logs', query_logs, {'service': service, 'query': 'error'})
+    dependencies = (health or {}).get('dependencies', {})
+    target = next((name for name, status in dependencies.items() if status != 'healthy'), service)
+    await collect('dependency_health', get_service_health, {'service': target})
+    await collect('deployments', get_recent_deployments, {'service': target})
+    await collect('dependency_logs', query_logs, {'service': target, 'query': 'error'})
+    return {'observations': observations, 'tool_errors': errors, 'completed_steps': completed}
 
 
-async def diagnose(state: dict[str, Any]) -> dict[str, Any]:
-    evidence = state.get("observations", [])
-    errors = state.get("tool_errors", [])
+def observed_action(state):
+    observations = state.get('observations', [])
+    health = [o['result'] for o in observations if o.get('tool') == 'get_service_health' and isinstance(o.get('result'), dict)]
+    deployments = [d for o in observations if o.get('tool') == 'get_recent_deployments' and isinstance(o.get('result'), dict) for d in o['result'].get('deployments', [])]
+    for deployment in deployments:
+        service = deployment.get('service')
+        degraded = any(h.get('service') == service and h.get('status') == 'degraded' for h in health)
+        error_logs = any(o.get('tool') == 'query_logs' and o.get('args', {}).get('service') == service and (o.get('result') or {}).get('matches') for o in observations)
+        previous = deployment.get('previous_version')
+        if degraded and error_logs and previous:
+            return {'action_type': 'rollback', 'service': service, 'target_version': previous, 'reason': 'Observed degraded service, error logs, and deployment with known previous version; causal relationship remains a hypothesis.', 'risk': 'requires operator assessment', 'requires_approval': True}
+    return None
 
-    gemini_diagnosis = diagnose_with_gemini(
-        state["alert"],
-        evidence,
-        errors,
-    )
+async def diagnose(state):
+    observations = state.get('observations', [])
+    evidence = [f"{o.get('id', 'Evidence')}: {o['tool']}({json.dumps(o.get('args', {}))}) returned {json.dumps(o.get('result'))}" for o in observations]
+    generated = await model_call(diagnose_with_gemini, state['alert'], observations, state.get('tool_errors', []))
+    diagnosis = generated or {'root_cause': 'Root cause not established; operator review required.', 'confidence': 0.0, 'evidence': evidence, 'blast_radius': state['alert']['service'], 'rollback_safe': False}
+    action = observed_action(state)
+    # Model narrative cannot create executable actions or assert rollback safety.
+    diagnosis = dict(diagnosis, rollback_safe=False)
+    return {'diagnosis': diagnosis, 'proposed_action': action, 'context_summary': f'{len(observations)} observations collected. ' + ('A candidate action requires review.' if action else 'No supported rollback target; escalate without mutation.'), 'status': 'investigating' if action else 'needs_human'}
 
-    if gemini_diagnosis:
-        diagnosis = gemini_diagnosis
-        diagnosis_source = "Gemini"
-    else:
-        diagnosis = {
-            "root_cause": "Recent payments-service v2.14.0 deployment caused dependency timeouts and checkout failures.",
-            "confidence": 0.86,
-            "evidence": [
-                "checkout-service reports payments-service timeouts",
-                "payments-service was deployed 22 minutes before the alert",
-                "payments-service logs show connection-pool exhaustion",
-            ],
-            "blast_radius": "checkout-service and payment processing",
-            "rollback_safe": True,
-        }
-        diagnosis_source = "deterministic rules"
-
-    proposed_action = {
-        "action_type": "rollback",
-        "service": "payments-service",
-        "target_version": "v2.13.2",
-        "reason": "Revert suspected regression introduced by v2.14.0",
-        "risk": "low",
-        "requires_approval": True,
-    }
-
-    summary = (
-        f"Investigated {state['alert'].get('service')}. "
-        f"Collected {len(evidence)} observations and encountered {len(errors)} tool failures. "
-        f"Diagnosis generated using {diagnosis_source}."
-    )
-
-    return {
-        "diagnosis": diagnosis,
-        "proposed_action": proposed_action,
-        "context_summary": summary,
-        "messages": [
-            {
-                "role": "assistant",
-                "content": summary,
-            }
-        ],
-    }
+async def request_approval(state):
+    if not state.get('proposed_action'):
+        return {'approval': {'decision': 'reject', 'operator_note': 'No evidence-supported action available'}, 'status': 'needs_human'}
+    decision = interrupt({'type': 'approval_required', 'proposed_action': state['proposed_action'], 'diagnosis': state['diagnosis']})
+    return {'approval': decision}
 
 
-async def request_approval(state: dict[str, Any]) -> dict[str, Any]:
-    decision = interrupt(
-        {
-            "type": "approval_required",
-            "diagnosis": state.get("diagnosis"),
-            "proposed_action": state.get("proposed_action"),
-            "question": "Approve the proposed remediation?",
-        }
-    )
+def recovered(health):
+    return health.get('status') == 'healthy' and health.get('error_rate', 1) < .01 and health.get('p99_latency_ms', float('inf')) < 1000
 
-    return {
-        "approval": decision,
-        "messages": [
-            {
-                "role": "assistant",
-                "content": f"Operator decision received: {decision.get('decision')}",
-            }
-        ],
-    }
-
-
-async def execute_remediation(state: dict[str, Any]) -> dict[str, Any]:
-    approval = state.get("approval") or {}
-
-    if approval.get("decision") != "approve":
-        return {
-            "status": "needs_human",
-            "messages": [
-                {
-                    "role": "assistant",
-                    "content": "Remediation declined. Incident remains open for manual handling.",
-                }
-            ],
-        }
-
-    action = state.get("proposed_action") or {}
-    result = await apply_remediation(
-        action_type=action["action_type"],
-        service=action["service"],
-        target_version=action.get("target_version"),
-        reason=action.get("reason", "Operator-approved remediation"),
-    )
-
-    verification = await get_service_health(action["service"])
-
-    return {
-        "status": "resolved",
-        "observations": state.get("observations", [])
-        + [
-            {"step": "remediation", "tool": "apply_remediation", "result": result},
-            {"step": "verification", "tool": "get_service_health", "result": verification},
-        ],
-        "messages": [
-            {
-                "role": "assistant",
-                "content": (
-                    f"Applied {action['action_type']} to {action['service']}. "
-                    f"Post-remediation status: {verification.get('status')}"
-                ),
-            }
-        ],
-    }
+async def execute_remediation(state):
+    if (state.get('approval') or {}).get('decision') != 'approve':
+        return {'status': 'needs_human'}
+    action = state.get('proposed_action')
+    if not action or action != observed_action(state):
+        raise ValueError('Proposed action no longer matches validated observations')
+    result = await asyncio.wait_for(apply_remediation(action_type=action['action_type'], service=action['service'], target_version=action['target_version'], reason=action['reason']), timeout=15)
+    target = await asyncio.wait_for(get_service_health(action['service']), timeout=10)
+    affected = await asyncio.wait_for(get_service_health(state['alert']['service']), timeout=10)
+    ok = recovered(target) and recovered(affected)
+    return {'status': 'resolved' if ok else 'needs_human', 'observations': state.get('observations', []) + [{'step': 'remediation', 'tool': 'apply_remediation', 'result': result}, {'step': 'verification', 'tool': 'get_service_health', 'result': target}, {'step': 'affected_service_verification', 'tool': 'get_service_health', 'result': affected}], 'messages': [{'role': 'assistant', 'content': 'Recovery criteria satisfied for target and affected service.' if ok else 'Action completed but recovery criteria failed; escalate to operator.'}]}
